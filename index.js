@@ -1,26 +1,19 @@
 /**
  * External Proxy Server for YouTube Downloads
  * Deploy this on a cloud service (Render, Railway, Vercel, etc.)
- * that has access to YouTube
+ * Uses play-dl for streaming (no external binary needed)
  */
 
 const express = require('express');
 const cors = require('cors');
-const ytdlp = require('yt-dlp-exec');
 const ytsr = require('ytsr');
-const fs = require('fs');
-const path = require('path');
+const play = require('play-dl');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
-
-const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
-if (!fs.existsSync(DOWNLOADS_DIR)) {
-    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-}
 
 // Health check
 app.get('/health', (req, res) => {
@@ -52,7 +45,7 @@ app.get('/api/search', async (req, res) => {
     }
 });
 
-// Get audio URL
+// Get audio URL using play-dl
 app.get('/api/audio-url/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
     console.log(`[Proxy] Audio URL: ${videoId}`);
@@ -63,21 +56,24 @@ app.get('/api/audio-url/:videoId', async (req, res) => {
 
     try {
         const url = `https://www.youtube.com/watch?v=${videoId}`;
-        const result = await ytdlp(url, {
-            getUrl: true,
-            format: 'bestaudio[ext=m4a]/bestaudio/best',
-            noCheckCertificates: true,
-            noWarnings: true
-        });
+        const info = await play.video_info(url);
 
-        res.json({ url: result.trim(), videoId });
+        // Get highest quality audio format
+        const format = info.format.filter(f => f.mimeType?.includes('audio'))
+            .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+        if (format && format.url) {
+            res.json({ url: format.url, videoId });
+        } else {
+            throw new Error('No audio format found');
+        }
     } catch (e) {
         console.error('[Proxy] Audio URL error:', e.message);
         res.status(500).json({ error: e.message });
     }
 });
 
-// Stream audio directly
+// Stream audio directly using play-dl
 app.get('/api/stream/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
     console.log(`[Proxy] Stream: ${videoId}`);
@@ -88,24 +84,32 @@ app.get('/api/stream/:videoId', async (req, res) => {
 
     try {
         const url = `https://www.youtube.com/watch?v=${videoId}`;
+        const stream = await play.stream(url, { quality: 2 });
 
-        // Get audio URL and redirect
-        const result = await ytdlp(url, {
-            getUrl: true,
-            format: 'bestaudio[ext=m4a]/bestaudio/best',
-            noCheckCertificates: true,
-            noWarnings: true
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Accept-Ranges', 'bytes');
+
+        stream.stream.pipe(res);
+
+        stream.stream.on('error', (err) => {
+            console.error('[Proxy] Stream error:', err.message);
+            if (!res.headersSent) {
+                res.status(500).send('Stream error');
+            }
         });
 
-        const audioUrl = result.trim();
-        res.redirect(audioUrl);
+        res.on('close', () => {
+            stream.stream.destroy();
+        });
     } catch (e) {
-        console.error('[Proxy] Stream error:', e.message);
-        res.status(500).send('Stream error');
+        console.error('[Proxy] Stream setup error:', e.message);
+        if (!res.headersSent) {
+            res.status(500).send('Stream error');
+        }
     }
 });
 
-// Download audio file
+// Download endpoint - just streams for now
 app.get('/api/download/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
     console.log(`[Proxy] Download: ${videoId}`);
@@ -114,41 +118,26 @@ app.get('/api/download/:videoId', async (req, res) => {
         return res.status(400).send('Invalid video ID');
     }
 
-    const outputPath = path.join(DOWNLOADS_DIR, `${videoId}.mp3`);
-
     try {
-        // Check cache
-        if (fs.existsSync(outputPath)) {
-            return res.sendFile(outputPath);
-        }
-
         const url = `https://www.youtube.com/watch?v=${videoId}`;
+        const stream = await play.stream(url, { quality: 2 });
 
-        await ytdlp(url, {
-            extractAudio: true,
-            audioFormat: 'mp3',
-            audioQuality: 0,
-            output: outputPath.replace('.mp3', '.%(ext)s'),
-            noCheckCertificates: true,
-            noWarnings: true
-        });
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp3"`);
 
-        // Find the downloaded file
-        const files = fs.readdirSync(DOWNLOADS_DIR);
-        const downloadedFile = files.find(f => f.startsWith(videoId));
+        stream.stream.pipe(res);
 
-        if (downloadedFile) {
-            const actualPath = path.join(DOWNLOADS_DIR, downloadedFile);
-            if (actualPath !== outputPath && fs.existsSync(actualPath)) {
-                fs.renameSync(actualPath, outputPath);
+        stream.stream.on('error', (err) => {
+            console.error('[Proxy] Download error:', err.message);
+            if (!res.headersSent) {
+                res.status(500).send('Download error');
             }
-            return res.sendFile(outputPath);
-        }
-
-        res.status(500).send('Download failed');
+        });
     } catch (e) {
-        console.error('[Proxy] Download error:', e.message);
-        res.status(500).send('Download error');
+        console.error('[Proxy] Download setup error:', e.message);
+        if (!res.headersSent) {
+            res.status(500).send('Download error');
+        }
     }
 });
 
