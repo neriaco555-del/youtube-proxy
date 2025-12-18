@@ -1,19 +1,33 @@
 /**
  * External Proxy Server for YouTube Downloads
- * Deploy this on a cloud service (Render, Railway, Vercel, etc.)
- * Uses play-dl for streaming (no external binary needed)
+ * Uses youtubei.js (Innertube) for reliable YouTube access
  */
 
 const express = require('express');
 const cors = require('cors');
 const ytsr = require('ytsr');
-const play = require('play-dl');
+const { Innertube } = require('youtubei.js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors());
 app.use(express.json());
+
+let yt = null;
+
+// Initialize Innertube
+async function initYT() {
+    if (!yt) {
+        console.log('[Proxy] Initializing Innertube...');
+        yt = await Innertube.create({
+            cache: false,
+            generate_session_locally: true
+        });
+        console.log('[Proxy] Innertube ready');
+    }
+    return yt;
+}
 
 // Health check
 app.get('/health', (req, res) => {
@@ -45,7 +59,7 @@ app.get('/api/search', async (req, res) => {
     }
 });
 
-// Get audio URL using play-dl
+// Get audio URL using youtubei.js
 app.get('/api/audio-url/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
     console.log(`[Proxy] Audio URL: ${videoId}`);
@@ -55,14 +69,18 @@ app.get('/api/audio-url/:videoId', async (req, res) => {
     }
 
     try {
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        const info = await play.video_info(url);
+        const youtube = await initYT();
+        const info = await youtube.getBasicInfo(videoId);
 
-        // Get highest quality audio format
-        const format = info.format.filter(f => f.mimeType?.includes('audio'))
-            .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+        // Get streaming data
+        const format = info.streaming_data?.adaptive_formats
+            ?.filter(f => f.mime_type?.includes('audio'))
+            ?.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 
-        if (format && format.url) {
+        if (format && format.decipher) {
+            const url = format.decipher(youtube.session.player);
+            res.json({ url, videoId });
+        } else if (format && format.url) {
             res.json({ url: format.url, videoId });
         } else {
             throw new Error('No audio format found');
@@ -73,7 +91,7 @@ app.get('/api/audio-url/:videoId', async (req, res) => {
     }
 });
 
-// Stream audio directly using play-dl
+// Stream audio directly
 app.get('/api/stream/:videoId', async (req, res) => {
     const videoId = req.params.videoId;
     console.log(`[Proxy] Stream: ${videoId}`);
@@ -83,64 +101,51 @@ app.get('/api/stream/:videoId', async (req, res) => {
     }
 
     try {
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        const stream = await play.stream(url, { quality: 2 });
+        const youtube = await initYT();
+        const info = await youtube.getBasicInfo(videoId);
 
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Accept-Ranges', 'bytes');
+        // Get best audio format
+        const format = info.streaming_data?.adaptive_formats
+            ?.filter(f => f.mime_type?.includes('audio'))
+            ?.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
 
-        stream.stream.pipe(res);
+        if (!format) {
+            throw new Error('No audio format available');
+        }
 
-        stream.stream.on('error', (err) => {
-            console.error('[Proxy] Stream error:', err.message);
-            if (!res.headersSent) {
-                res.status(500).send('Stream error');
-            }
-        });
+        let audioUrl;
+        if (format.decipher) {
+            audioUrl = format.decipher(youtube.session.player);
+        } else if (format.url) {
+            audioUrl = format.url;
+        } else {
+            throw new Error('Cannot get audio URL');
+        }
 
-        res.on('close', () => {
-            stream.stream.destroy();
-        });
+        // Redirect to audio URL
+        res.redirect(audioUrl);
     } catch (e) {
-        console.error('[Proxy] Stream setup error:', e.message);
+        console.error('[Proxy] Stream error:', e.message);
         if (!res.headersSent) {
-            res.status(500).send('Stream error');
+            res.status(500).send('Stream error: ' + e.message);
         }
     }
 });
 
-// Download endpoint - just streams for now
-app.get('/api/download/:videoId', async (req, res) => {
-    const videoId = req.params.videoId;
-    console.log(`[Proxy] Download: ${videoId}`);
-
-    if (!videoId || videoId.length !== 11) {
-        return res.status(400).send('Invalid video ID');
-    }
-
-    try {
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        const stream = await play.stream(url, { quality: 2 });
-
-        res.setHeader('Content-Type', 'audio/mpeg');
-        res.setHeader('Content-Disposition', `attachment; filename="${videoId}.mp3"`);
-
-        stream.stream.pipe(res);
-
-        stream.stream.on('error', (err) => {
-            console.error('[Proxy] Download error:', err.message);
-            if (!res.headersSent) {
-                res.status(500).send('Download error');
-            }
-        });
-    } catch (e) {
-        console.error('[Proxy] Download setup error:', e.message);
-        if (!res.headersSent) {
-            res.status(500).send('Download error');
-        }
-    }
+// Download endpoint - redirects to stream
+app.get('/api/download/:videoId', (req, res) => {
+    res.redirect(`/api/stream/${req.params.videoId}`);
 });
 
-app.listen(PORT, () => {
-    console.log(`External Proxy Server running on port ${PORT}`);
+// Initialize and start
+initYT().then(() => {
+    app.listen(PORT, () => {
+        console.log(`External Proxy Server running on port ${PORT}`);
+    });
+}).catch(e => {
+    console.error('Failed to initialize Innertube:', e);
+    // Start anyway, will retry on first request
+    app.listen(PORT, () => {
+        console.log(`External Proxy Server running on port ${PORT} (Innertube will init on first request)`);
+    });
 });
